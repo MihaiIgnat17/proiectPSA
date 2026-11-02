@@ -63,6 +63,7 @@ class EQSettings:
     lpf_freq: float = 12000.0
     filter_order: int = 4
     clip_mode: str = CLIP_MODES[0]
+    auto_headroom: bool = False
 
 
 # =============================================================================
@@ -152,19 +153,21 @@ class Equalizer3Band:
 
     # ------------------------------------------------------------ lanț filtre
     @classmethod
-    def build_sos(cls, settings: EQSettings, fs: int) -> np.ndarray:
+    def build_sos(cls, settings: EQSettings, fs: int, skip_neutral: bool = True) -> np.ndarray:
         """Concatenează toate etajele într-o singură matrice SOS (N x 6).
         Filtrele în cascadă = produsul funcțiilor de transfer, ceea ce în
         format SOS înseamnă simpla suprapunere a rândurilor."""
         nyq = fs / 2.0
         sections = []
 
-        # Benzile la 0 dB sunt identitate - le omitem ca să economisim calcul.
-        if settings.bass_db != 0:
+        # Benzile la 0 dB sunt identitate (A = 1 => b == a) - le omitem ca să
+        # economisim calcul. În redarea live le păstrăm (skip_neutral=False) ca
+        # numărul de secțiuni, deci și starea filtrului, să rămână constant.
+        if settings.bass_db != 0 or not skip_neutral:
             sections.append(cls.low_shelf(fs, LOW_CROSSOVER, settings.bass_db))
-        if settings.mid_db != 0:
+        if settings.mid_db != 0 or not skip_neutral:
             sections.append(cls.peaking(fs, LOW_CROSSOVER, HIGH_CROSSOVER, settings.mid_db))
-        if settings.treble_db != 0:
+        if settings.treble_db != 0 or not skip_neutral:
             sections.append(cls.high_shelf(fs, HIGH_CROSSOVER, settings.treble_db))
 
         # Butterworth: răspuns maxim plat în banda de trecere.
@@ -205,6 +208,16 @@ class Equalizer3Band:
             return x
         return x * (10.0 ** (target_db / 20.0) / peak)
 
+    @staticmethod
+    def headroom_gain(settings: EQSettings) -> float:
+        """Pre-atenuare egală cu cel mai mare boost (ex. +6 dB -> x0.5).
+        Muzica masterizată are deja vârfuri aproape de 0 dBFS, deci orice boost
+        ar intra în limitator și s-ar auzi ca distorsiune, nu ca schimbare de timbru."""
+        if not settings.auto_headroom:
+            return 1.0
+        boost = max(0.0, settings.bass_db, settings.mid_db, settings.treble_db)
+        return 10.0 ** (-boost / 20.0)
+
     # ------------------------------------------------------------ procesare
     @classmethod
     def process(cls, data: np.ndarray, fs: int, settings: EQSettings) -> np.ndarray:
@@ -212,7 +225,9 @@ class Equalizer3Band:
         Filtrarea se face pe axa 0 (timp), deci fiecare canal e filtrat
         independent, fără probleme de shape între mono și stereo."""
         sos = cls.build_sos(settings, fs)
-        y = data.astype(np.float64)               # precizie mai bună în filtrare
+        # float64 pentru precizie mai bună în filtrare; câștigul e liniar, deci
+        # poate fi aplicat înainte de filtre.
+        y = data.astype(np.float64) * cls.headroom_gain(settings)
         if len(sos):
             y = signal.sosfilt(sos, y, axis=0)
 
@@ -279,9 +294,15 @@ class EqualizerApp:
         self.busy = False
         self.results = queue.Queue()              # rezultate de la thread-urile de lucru
 
+        # Redare live
+        self.stream = None                        # sd.OutputStream activ
+        self.play_pos = 0                         # eșantionul curent
+        self.zi = None                            # starea internă a filtrelor între blocuri
+        self.live = None                          # (sos, gain, clip_mode) folosit de callback
+
         self._build_vars()
         self._build_ui()
-        self.draw_response()
+        self._on_settings_changed()
         self.root.after(50, self._poll_results)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -296,13 +317,16 @@ class EqualizerApp:
         self.lpf_freq = tk.StringVar(value="12000")
         self.order = tk.StringVar(value="4")
         self.clip_mode = tk.StringVar(value=CLIP_MODES[0])
+        # Implicit dezactivat: cu headroom, un boost de bas atenuează tot restul
+        # semnalului, iar basul rămâne la nivelul inițial (sună ca o scădere).
+        self.headroom = tk.BooleanVar(value=False)
         self.export_fmt = tk.StringVar(value=EXPORT_FORMATS[0])
         self.file_info = tk.StringVar(value="Niciun fișier încărcat")
         self.status = tk.StringVar(value="Gata")
 
         for var in (self.bass, self.mid, self.treble, self.hpf_on, self.hpf_freq,
-                    self.lpf_on, self.lpf_freq, self.order, self.clip_mode):
-            var.trace_add("write", lambda *_: self.draw_response())
+                    self.lpf_on, self.lpf_freq, self.order, self.clip_mode, self.headroom):
+            var.trace_add("write", lambda *_: self._on_settings_changed())
 
     def _build_ui(self):
         pad = {"padx": 8, "pady": 6}
@@ -349,9 +373,11 @@ class EqualizerApp:
         ttk.Label(opt, text="Anti-clipping").grid(row=4, column=0, sticky="w")
         ttk.Combobox(opt, textvariable=self.clip_mode, values=CLIP_MODES, width=22,
                      state="readonly").grid(row=4, column=1, columnspan=2, sticky="w", padx=4)
-        ttk.Label(opt, text="Format export").grid(row=5, column=0, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(opt, text="Headroom automat (fără distorsiuni la boost)",
+                        variable=self.headroom).grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        ttk.Label(opt, text="Format export").grid(row=6, column=0, sticky="w", pady=(6, 0))
         ttk.Combobox(opt, textvariable=self.export_fmt, values=EXPORT_FORMATS, width=22,
-                     state="readonly").grid(row=5, column=1, columnspan=2, sticky="w", padx=4, pady=(6, 0))
+                     state="readonly").grid(row=6, column=1, columnspan=2, sticky="w", padx=4, pady=(6, 0))
 
         # --- Grafic răspuns în frecvență
         plot_frame = ttk.LabelFrame(main, text="Răspuns în frecvență", padding=8)
@@ -387,11 +413,15 @@ class EqualizerApp:
     def _db_to_y(self, db):
         return self.PLOT_H / 2 - db / self.PLOT_DB * (self.PLOT_H / 2 - 10)
 
-    def draw_response(self):
+    def _on_settings_changed(self):
         try:
             settings = self.current_settings()
         except (tk.TclError, ValueError):
             return                                 # valoare intermediară invalidă
+        self.draw_response(settings)
+        self._update_live_filter(settings)
+
+    def draw_response(self, settings: EQSettings):
         fs = self.fs or 44100
         f_min, f_max = 20.0, min(20000.0, fs / 2 * 0.999)
         c = self.canvas
@@ -430,6 +460,7 @@ class EqualizerApp:
             lpf_freq=float(self.lpf_freq.get()),
             filter_order=int(self.order.get()),
             clip_mode=self.clip_mode.get(),
+            auto_headroom=self.headroom.get(),
         )
 
     def reset_bands(self):
@@ -448,13 +479,58 @@ class EqualizerApp:
 
     # ----------------------------------------------------- redare/export
     def play(self):
+        """Redare în timp real: semnalul e filtrat bloc cu bloc în callback-ul
+        audio, deci mutarea glisoarelor se aude imediat."""
         if sd is None or self.audio is None or self.busy:
             return
-        self._process_then("play")
+        self.stop()
+        self.play_pos = 0
+        self.zi = None
+        channels = 1 if self.audio.ndim == 1 else self.audio.shape[1]
+        try:
+            self.stream = sd.OutputStream(samplerate=self.fs, channels=channels, dtype="float32",
+                                          blocksize=1024, callback=self._audio_callback)
+            self.stream.start()
+        except Exception as exc:
+            self.stream = None
+            messagebox.showerror("Eroare redare", str(exc))
 
     def stop(self):
-        if sd is not None:
-            sd.stop()
+        if self.stream is not None:
+            self.stream.stop()
+            self.stream.close()
+            self.stream = None
+            self.status.set("Oprit")
+
+    def _update_live_filter(self, settings: EQSettings):
+        sos = Equalizer3Band.build_sos(settings, self.fs or 44100, skip_neutral=False)
+        # O singură atribuire (atomică) - callback-ul audio citește tuplul întreg.
+        self.live = (sos, Equalizer3Band.headroom_gain(settings), settings.clip_mode)
+
+    def _audio_callback(self, outdata, frames, time_info, status):
+        """Rulează în thread-ul audio (fără apeluri Tk aici!).
+        Filtrarea pe blocuri e echivalentă cu filtrarea întregului semnal doar
+        dacă starea internă a filtrelor (zi) e transmisă de la un bloc la altul."""
+        sos, gain, clip_mode = self.live
+        block = self.audio[self.play_pos:self.play_pos + frames]
+        n = len(block)
+        self.play_pos += n
+
+        x = block.astype(np.float64) * gain
+        # Forma lui zi pentru sosfilt pe axa 0: (secțiuni, 2, canale...)
+        zi_shape = (len(sos), 2) + x.shape[1:]
+        if self.zi is None or self.zi.shape != zi_shape:
+            self.zi = np.zeros(zi_shape)          # s-a schimbat numărul de secțiuni (HPF/LPF)
+        if len(sos):
+            x, self.zi = signal.sosfilt(sos, x, axis=0, zi=self.zi)
+        # Normalizarea are nevoie de vârful întregului semnal, deci live folosim soft clip.
+        if clip_mode != CLIP_MODES[2]:
+            x = Equalizer3Band.soft_clip(x)
+
+        outdata[:n] = np.clip(x, -1.0, 1.0).reshape(n, -1)
+        if n < frames:
+            outdata[n:] = 0
+            raise sd.CallbackStop
 
     def save(self):
         if self.audio is None or self.busy:
@@ -467,7 +543,7 @@ class EqualizerApp:
 
     def _process_then(self, action, **extra):
         """Procesează (sau refolosește cache-ul) într-un thread separat,
-        apoi execută acțiunea (play/save) în thread-ul principal."""
+        apoi execută acțiunea în thread-ul principal."""
         settings = self.current_settings()
         if self.processed is not None and self.processed_key == settings:
             self._finish(action, self.processed, settings, extra)
@@ -479,11 +555,7 @@ class EqualizerApp:
 
     def _finish(self, action, processed, settings, extra):
         self.processed, self.processed_key = processed, settings
-        if action == "play":
-            self.stop()
-            sd.play(processed, self.fs)
-            self.status.set("Redare...")
-        elif action == "save":
+        if action == "save":
             path, fmt, fs = extra["path"], extra["fmt"], self.fs
             # Și scrierea pe disc poate dura pentru fișiere mari.
             self._run_in_thread("saved", lambda: (save_wav(path, fs, processed, fmt), path)[1],
@@ -521,6 +593,15 @@ class EqualizerApp:
                 self._update_buttons()
         except queue.Empty:
             pass
+
+        if self.stream is not None:
+            if self.stream.active:
+                fmt = lambda s: f"{int(s) // 60}:{int(s) % 60:02d}"
+                self.status.set(f"Redare live  {fmt(self.play_pos / self.fs)} / "
+                                f"{fmt(len(self.audio) / self.fs)}")
+            else:                                 # s-a terminat fișierul
+                self.stop()
+                self.status.set("Redare terminată")
         self.root.after(50, self._poll_results)
 
     def _handle_result(self, tag, result):
@@ -536,10 +617,10 @@ class EqualizerApp:
                 name = name[:29] + "..."
             self.file_info.set(f"{name}  |  {fs} Hz  |  {kind}  |  {duration:.1f} s")
             self.status.set("Fișier încărcat")
-            self.draw_response()                  # axa de frecvență depinde de fs
+            self._on_settings_changed()           # filtrele și graficul depind de fs
         elif tag == "saved":
             self.status.set(f"Salvat: {os.path.basename(result)}")
-        else:                                     # play / save după procesare
+        else:                                     # save după procesare
             processed, settings, extra = result
             self.status.set("Procesare terminată")
             self._finish(tag, processed, settings, extra)
